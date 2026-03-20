@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+# ============================================================
+#  cc-switch  —  Interactive Claude Code backend switcher
+#  Place this file somewhere on your PATH, e.g. ~/bin/cc-switch
+#  Then add to ~/.bashrc:
+#    source ~/bin/cc-switch
+#
+#  API keys are read from ~/.bashrc at call time. Add these
+#  export lines to your ~/.bashrc (not this file):
+#    export ANTHROPIC_API_KEY="sk-ant-..."
+#    export ZAI_API_KEY="..."
+#    export ZAI_BASE_URL="https://api.z.ai/v1"   # optional override
+# ============================================================
+
+# ── Resolve keys from environment at call time ───────────────
+# Keys are NOT stored here. They are read from the calling shell's
+# environment, which sources ~/.bashrc. If not already exported,
+# we do a one-shot source of ~/.bashrc to pick them up.
+_cc_load_keys() {
+  # Always source ~/.bashrc to ensure all keys are loaded fresh.
+  # We can't rely on the current environment being complete — e.g. if the
+  # Anthropic backend ran first it may have unset ANTHROPIC_API_KEY, and
+  # the || short-circuit would skip sourcing entirely if one key is already set.
+  # shellcheck source=/dev/null
+  [[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
+
+  ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
+  ZAI_KEY="${ZAI_API_KEY:-}"
+  # z.ai's Anthropic-compatible endpoint (used by Claude Code)
+  ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/v1}"
+}
+
+# ── Script version ───────────────────────────────────────────
+CC_SWITCH_VERSION="1.8 — 2026-03-12"
+
+# ── Helper: parse a JSON model list ──────────────────────────
+# Prints one model ID per line, sorted.
+# $1 = raw JSON, $2 = jq filter (e.g. '.data[].id')
+_cc_parse_models() {
+  local json="$1" filter="$2"
+  if command -v jq &>/dev/null; then
+    echo "$json" | jq -r "$filter" 2>/dev/null | sort
+  elif command -v python3 &>/dev/null; then
+    echo "$json" | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+# Resolve a simple jq-like path e.g. '.data[].id'
+keys = [k for k in re.split(r'\.|\[\]', '$filter') if k]
+obj = data
+for k in keys[:-1]:
+    obj = obj[k] if isinstance(obj, dict) else [i[k] for i in obj]
+leaf = keys[-1]
+ids = [i[leaf] for i in (obj if isinstance(obj, list) else [obj]) if leaf in i and i[leaf]]
+for m in sorted(ids):
+    print(m)
+" 2>/dev/null
+  fi
+}
+
+# ── Colours ──────────────────────────────────────────────────
+BOLD='\033[1m'
+DIM='\033[2m'
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+RESET='\033[0m'
+
+# ── Helper: ensure sudo credentials are cached ───────────────
+# Runs sudo -v only when the timestamp is absent or nearly expired.
+# Claude Code inherits the refreshed timestamp and can run sudo commands
+# for the duration of the session (typically 15 min, reset on each use).
+_cc_refresh_sudo() {
+  if sudo -n true 2>/dev/null; then
+    # Credentials already cached — silently extend the timestamp
+    sudo -v
+  else
+    echo -e "${DIM}Sudo credentials needed so Claude Code can run privileged commands.${RESET}"
+    sudo -v || {
+      echo -e "${YELLOW}sudo -v failed — Claude Code will not be able to run sudo commands.${RESET}"
+    }
+  fi
+}
+
+
+# Usage: _cc_menu "Prompt" item1 item2 ...
+# Sets REPLY to the chosen item string.
+_cc_menu() {
+  local prompt="$1"; shift
+  local items=("$@")
+  local i choice
+
+  echo ""
+  for i in "${!items[@]}"; do
+    printf "  ${CYAN}%2d)${RESET} %s\n" "$((i+1))" "${items[$i]}"
+  done
+  echo ""
+
+  while true; do
+    read -rp "$(echo -e "${BOLD}${prompt}${RESET} [1-${#items[@]}]: ")" choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#items[@]} )); then
+      REPLY="${items[$((choice-1))]}"
+      return 0
+    fi
+    echo -e "  ${YELLOW}Please enter a number between 1 and ${#items[@]}${RESET}"
+  done
+}
+
+# ── Helper: scrollable arrow-key menu with optional per-item hints ────────────
+# Usage: _cc_scroll_menu "Prompt" hint_callback item1 item2 ...
+#   hint_callback: name of a function that receives an item string and prints
+#                  a one-line hint (or nothing) to stdout.  Pass "" to disable.
+# Sets REPLY to the chosen item string.
+# Returns 1 if the user presses q/Q or Escape to abort.
+_cc_scroll_menu() {
+  local prompt="$1"; shift
+  local hint_cb="$1"; shift
+  local items=("$@")
+  local n=${#items[@]}
+  local idx=0
+  local visible=12   # max rows shown at once
+  local key esc seq
+
+  # Terminal helpers
+  local _hide='\033[?25l' _show='\033[?25h'
+  local _up='\033[A' _clr='\033[2K' _home='\033[G'
+
+  # Save cursor, hide it
+  printf '%b' "$_hide"
+  tput sc 2>/dev/null || true
+
+  _render_scroll_menu() {
+    local cur_idx="$1"
+    local start=$(( cur_idx - visible/2 ))
+    (( start < 0 )) && start=0
+    (( start + visible > n )) && start=$(( n - visible ))
+    (( start < 0 )) && start=0
+    local end=$(( start + visible ))
+    (( end > n )) && end=$n
+
+    local hint=""
+    [[ -n "$hint_cb" ]] && hint=$("$hint_cb" "${items[$cur_idx]}" 2>/dev/null)
+
+    # Calculate lines printed last time (stored in _scroll_lines)
+    local lines_to_clear=${_scroll_lines:-0}
+    # Move up and clear previous render
+    local i
+    for (( i=0; i<lines_to_clear; i++ )); do
+      printf '%b' "${_up}${_clr}${_home}"
+    done
+
+    local rendered=0
+    echo ""
+    (( rendered++ ))
+
+    # Scroll indicator top
+    if (( start > 0 )); then
+      printf "  ${DIM}↑ %d more${RESET}\n" "$start"
+      (( rendered++ ))
+    fi
+
+    for (( i=start; i<end; i++ )); do
+      if (( i == cur_idx )); then
+        printf "  ${CYAN}${BOLD}▶ %s${RESET}\n" "${items[$i]}"
+      else
+        printf "  ${DIM}  %s${RESET}\n" "${items[$i]}"
+      fi
+      (( rendered++ ))
+    done
+
+    # Scroll indicator bottom
+    if (( end < n )); then
+      printf "  ${DIM}↓ %d more${RESET}\n" "$(( n - end ))"
+      (( rendered++ ))
+    fi
+
+    echo ""
+    (( rendered++ ))
+
+    # Hint line (always present to keep layout stable)
+    if [[ -n "$hint" ]]; then
+      printf "  ${YELLOW}⚠  %s${RESET}\n" "$hint"
+    else
+      printf "  ${DIM}✔  Tool calling supported${RESET}\n"
+    fi
+    (( rendered++ ))
+
+    printf "  ${DIM}↑/↓ navigate · Enter select · q quit${RESET}\n"
+    (( rendered++ ))
+
+    _scroll_lines=$rendered
+  }
+
+  _scroll_lines=0
+  _render_scroll_menu "$idx"
+
+  # Read keys (supports arrow keys as escape sequences)
+  while true; do
+    IFS= read -rsn1 key
+    case "$key" in
+      $'\x1b')   # ESC or start of arrow sequence
+        IFS= read -rsn1 -t 0.05 esc
+        if [[ "$esc" == "[" ]]; then
+          IFS= read -rsn1 -t 0.05 seq
+          case "$seq" in
+            A) (( idx > 0 ))     && (( idx-- )) ;;   # Up
+            B) (( idx < n-1 ))   && (( idx++ )) ;;   # Down
+          esac
+        else
+          # Plain ESC or q → cancel
+          printf '%b' "$_show"
+          echo ""
+          return 1
+        fi
+        ;;
+      $'\n'|$'\r'|'')
+        printf '%b' "$_show"
+        echo ""
+        REPLY="${items[$idx]}"
+        return 0
+        ;;
+      q|Q)
+        printf '%b' "$_show"
+        echo ""
+        return 1
+        ;;
+      k) (( idx > 0 ))   && (( idx-- )) ;;   # vim-style up
+      j) (( idx < n-1 )) && (( idx++ )) ;;   # vim-style down
+    esac
+    _render_scroll_menu "$idx"
+  done
+}
+
+# ── Backend: Anthropic (claude.ai Pro subscription) ──────────
+_cc_backend_anthropic() {
+  _cc_load_keys
+
+  # Use the API key only for the model list fetch — do NOT export it,
+  # as that conflicts with the claude.ai subscription session.
+  if [[ -z "$ANTHROPIC_KEY" ]]; then
+    echo -e "${YELLOW}Warning: ANTHROPIC_API_KEY not found in environment or ~/.bashrc.${RESET}"
+    echo -e "${DIM}The key is needed to fetch the model list but will not be passed to Claude Code.${RESET}"
+    echo -e "${DIM}Add: export ANTHROPIC_API_KEY=\"sk-ant-...\" to your ~/.bashrc${RESET}"
+    return 1
+  fi
+
+  # Fetch live model list using the key — never exported to Claude Code
+  echo -e "${DIM}Fetching available models from Anthropic...${RESET}"
+  local raw
+  raw=$(curl -sf "https://api.anthropic.com/v1/models" \
+    -H "x-api-key: $ANTHROPIC_KEY" \
+    -H "anthropic-version: 2023-06-01" 2>/dev/null)
+
+  local model_list=()
+  if [[ -n "$raw" ]]; then
+    mapfile -t model_list < <(_cc_parse_models "$raw" '.data[].id')
+  fi
+
+  if [[ ${#model_list[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}Could not fetch model list from Anthropic. Check your API key and connectivity.${RESET}"
+    return 1
+  fi
+
+  echo -e "\n${BOLD}Available Anthropic models:${RESET}"
+  _cc_scroll_menu "Select model" "" "${model_list[@]}"
+  if [[ $? -ne 0 ]]; then
+    echo -e "${YELLOW}Cancelled.${RESET}"
+    return 1
+  fi
+  local model="$REPLY"
+
+  # Clear any API key / third-party vars so claude.ai session takes over
+  unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+  export ANTHROPIC_MODEL="$model"
+
+  # Derive the friendly alias for display (opus/sonnet/haiku)
+  local alias_label
+  case "$model" in
+    *opus*)  alias_label="Opus  (complex tasks)" ;;
+    *sonnet*)alias_label="Sonnet (main tasks)" ;;
+    *haiku*) alias_label="Haiku  (fast tasks)" ;;
+    *)       alias_label="Model" ;;
+  esac
+
+  echo -e "\n${GREEN}${BOLD}✔ Backend:${RESET}${GREEN} Anthropic (claude.ai Pro subscription)${RESET}"
+  echo -e "${GREEN}${BOLD}  ${alias_label}: ${RESET}${GREEN}${model}${RESET}"
+  echo -e "${DIM}  Lighter-tier routing managed by Claude Code / Pro subscription${RESET}\n"
+  _cc_refresh_sudo
+  claude --model "$model" --dangerously-skip-permissions
+}
+
+# ── Backend: z.ai ────────────────────────────────────────────
+_cc_backend_zai() {
+  _cc_load_keys
+
+  if [[ -z "$ZAI_KEY" ]]; then
+    echo -e "${YELLOW}Warning: ZAI_API_KEY not found in environment or ~/.bashrc.${RESET}"
+    echo -e "${DIM}Add: export ZAI_API_KEY=\"...\" to your ~/.bashrc${RESET}"
+    return 1
+  fi
+
+  # z.ai uses an OpenAI-compatible API; the base URL for their general API is:
+  local zai_api_base="https://api.z.ai/api/paas/v4"
+
+  # Fetch live model list from z.ai's OpenAI-compatible /models endpoint
+  echo -e "${DIM}Fetching available models from z.ai...${RESET}"
+  local raw
+  raw=$(curl -sf "${zai_api_base}/models" \
+    -H "Authorization: Bearer $ZAI_KEY" \
+    -H "Content-Type: application/json" 2>/dev/null)
+
+  local model_list=()
+  if [[ -n "$raw" ]]; then
+    mapfile -t model_list < <(_cc_parse_models "$raw" '.data[].id')
+  fi
+
+  if [[ ${#model_list[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}Could not fetch model list from z.ai. Check your API key and connectivity.${RESET}"
+    return 1
+  fi
+
+  echo -e "\n${BOLD}Available z.ai models:${RESET}"
+  _cc_scroll_menu "Select model" "" "${model_list[@]}"
+  if [[ $? -ne 0 ]]; then
+    echo -e "${YELLOW}Cancelled.${RESET}"
+    return 1
+  fi
+  local model="$REPLY"
+
+  # Apply environment
+  # Use z.ai's Anthropic-compatible endpoint (not the OpenAI-compat one)
+  export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
+  export ANTHROPIC_AUTH_TOKEN="$ZAI_KEY"
+
+  # Tiered model mapping: your selected model sets the opus slot (ceiling).
+  # Lighter models fill sonnet and haiku tiers, matching z.ai's own recommendations:
+  #   opus  → your selected model (heaviest reasoning)
+  #   sonnet → glm-4.7 if available and heavier model selected, else selected model
+  #   haiku  → glm-4.5-air if available, else glm-4.5, else selected model
+  local sonnet_model="$model"
+  local haiku_model="$model"
+
+  # Only downgrade tiers if the selected model is heavier than the tier default
+  # GLM weight order (lightest→heaviest): glm-4.5-air < glm-4.5 < glm-4.6 < glm-4.7 < glm-5
+  declare -A glm_weight=([glm-4.5-air]=1 [glm-4.5]=2 [glm-4.6]=3 [glm-4.7]=4 [glm-5]=5)
+  local selected_weight="${glm_weight[$model]:-3}"  # default to mid if unknown
+
+  if (( selected_weight > 4 )) && printf '%s\n' "${model_list[@]}" | grep -q "^glm-4.7$"; then
+    sonnet_model="glm-4.7"
+  fi
+  if (( selected_weight > 2 )); then
+    if printf '%s\n' "${model_list[@]}" | grep -q "^glm-4.5-air$"; then
+      haiku_model="glm-4.5-air"
+    elif printf '%s\n' "${model_list[@]}" | grep -q "^glm-4.5$"; then
+      haiku_model="glm-4.5"
+    fi
+  fi
+
+  export ANTHROPIC_MODEL="$model"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$sonnet_model"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$haiku_model"
+  # Prevent background calls to Anthropic's servers (would fail with a z.ai key)
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  export API_TIMEOUT_MS=3000000
+  unset ANTHROPIC_API_KEY
+
+  echo -e "\n${MAGENTA}${BOLD}✔ Backend:${RESET}${MAGENTA} z.ai (https://api.z.ai/api/anthropic)${RESET}"
+  echo -e "${MAGENTA}${BOLD}  Opus   (complex tasks): ${RESET}${MAGENTA}${model}${RESET}"
+  echo -e "${MAGENTA}${BOLD}  Sonnet (main tasks):    ${RESET}${MAGENTA}${sonnet_model}${RESET}"
+  echo -e "${MAGENTA}${BOLD}  Haiku  (fast tasks):    ${RESET}${MAGENTA}${haiku_model}${RESET}"
+  echo ""
+  _cc_refresh_sudo
+  claude --model "$model" --dangerously-skip-permissions
+}
+
+# ── Backend: Ollama (local) ──────────────────────────────────
+_cc_backend_ollama() {
+  local ollama_url="${OLLAMA_HOST:-http://localhost:11434}"
+
+  # Check if ollama is reachable
+  if ! curl -sf "${ollama_url}/api/tags" >/dev/null 2>&1; then
+    echo -e "${YELLOW}Cannot reach Ollama at ${ollama_url}${RESET}"
+    echo -e "${DIM}Is the ollama service running? Try: systemctl status ollama${RESET}"
+    return 1
+  fi
+
+  # Fetch available models from ollama API
+  local raw
+  raw=$(curl -sf "${ollama_url}/api/tags" 2>/dev/null)
+  if [[ -z "$raw" ]]; then
+    echo -e "${YELLOW}Could not retrieve model list from Ollama.${RESET}"
+    return 1
+  fi
+
+  # Parse model names
+  local model_list=()
+  if [[ -n "$raw" ]]; then
+    mapfile -t model_list < <(_cc_parse_models "$raw" '.models[].name')
+  fi
+
+  if command -v jq &>/dev/null || command -v python3 &>/dev/null; then
+    : # parser available
+  else
+    echo -e "${YELLOW}Neither jq nor python3 found — cannot parse model list.${RESET}"
+    return 1
+  fi
+
+  if [[ ${#model_list[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No models found in Ollama. Pull one first, e.g.: ollama pull qwen2.5:32b${RESET}"
+    return 1
+  fi
+
+  # ── Pre-fetch capability info for all models ──────────────
+  echo -e "${DIM}Checking tool-calling capabilities for ${#model_list[@]} model(s)...${RESET}"
+  declare -A _ollama_tools_ok=()
+  local m
+  for m in "${model_list[@]}"; do
+    local info
+    info=$(curl -sf "${ollama_url}/api/show" \
+      -H "Content-Type: application/json" \
+      -d "{\"name\":\"${m}\"}" 2>/dev/null)
+    local has_tools=false
+    if [[ -n "$info" ]]; then
+      if command -v jq &>/dev/null; then
+        if echo "$info" | jq -e '.capabilities // [] | index("tools") != null' >/dev/null 2>&1; then
+          has_tools=true
+        fi
+      else
+        if echo "$info" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+sys.exit(0 if 'tools' in d.get('capabilities',[]) else 1)
+" 2>/dev/null; then
+          has_tools=true
+        fi
+      fi
+    fi
+    _ollama_tools_ok["$m"]=$has_tools
+  done
+
+  # ── Hint callback for the scroll menu ─────────────────────
+  # Prints a warning string when the model lacks tool calling; empty if fine.
+  _ollama_tool_hint() {
+    local model="$1"
+    if [[ "${_ollama_tools_ok[$model]:-false}" != "true" ]]; then
+      echo "No tool-calling support detected — Claude Code will likely error"
+    fi
+  }
+
+  echo -e "\n${BOLD}Models available in Ollama (${ollama_url}):${RESET}"
+  echo -e "${DIM}  Claude Code requires tool calling. Recommended: qwen2.5, qwen3-coder, glm variants.${RESET}"
+
+  _cc_scroll_menu "Select model" "_ollama_tool_hint" "${model_list[@]}"
+  if [[ $? -ne 0 ]]; then
+    echo -e "${YELLOW}Cancelled.${RESET}"
+    return 1
+  fi
+  local model="$REPLY"
+
+  # Apply environment
+  export ANTHROPIC_BASE_URL="$ollama_url"
+  export ANTHROPIC_AUTH_TOKEN="ollama"
+  export ANTHROPIC_API_KEY=""
+  export ANTHROPIC_MODEL="$model"
+
+  echo -e "\n${BLUE}${BOLD}✔ Backend:${RESET}${BLUE} Ollama local (${ollama_url})${RESET}"
+  echo -e "${BLUE}${BOLD}  Model:  ${RESET}${BLUE} ${model}${RESET}"
+  echo -e "${DIM}  Tip: ensure the model's context window is ≥ 64k tokens (set num_ctx in its Modelfile)${RESET}"
+  if [[ "${_ollama_tools_ok[$model]:-false}" != "true" ]]; then
+    echo -e "${YELLOW}  Warning: ${model} may not support tool calling — Claude Code will likely error.${RESET}"
+    echo -e "${YELLOW}  Consider: qwen2.5:32b, qwen3-coder, or glm variants instead.${RESET}"
+  fi
+  echo ""
+  _cc_refresh_sudo
+  claude --model "$model" --dangerously-skip-permissions
+}
+
+# ── Main entrypoint ──────────────────────────────────────────
+cc() {
+  echo -e "\n${BOLD}╭─────────────────────────────────────╮"
+  echo -e "│      Claude Code  —  Backend Menu   │"
+  echo -e "╰─────────────────────────────────────╯${RESET}"
+  echo -e "${DIM}  cc-switch v${CC_SWITCH_VERSION}${RESET}"
+
+  local backends=("Anthropic API (Claude Pro)" "z.ai" "Ollama (local models)")
+  _cc_scroll_menu "Select backend" "" "${backends[@]}"
+  if [[ $? -ne 0 ]]; then
+    echo -e "${YELLOW}Cancelled.${RESET}"
+    return
+  fi
+
+  case "$REPLY" in
+    "Anthropic API (Claude Pro)") _cc_backend_anthropic ;;
+    "z.ai")                       _cc_backend_zai ;;
+    "Ollama (local models)")      _cc_backend_ollama ;;
+  esac
+}
+
+# Also expose individual backends directly if preferred
+alias cc-anthropic='_cc_backend_anthropic'
+alias cc-zai='_cc_backend_zai'
+alias cc-local='_cc_backend_ollama'
+
+# cc-switch v1.9 — 2026-03-12
