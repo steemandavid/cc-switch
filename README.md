@@ -6,9 +6,11 @@ Interactive Claude Code backend switcher with provider and model selection.
 
 - **Multiple backends**: Anthropic API (Claude Pro), z.ai, Ollama (local models)
 - **Live model discovery**: Fetches available models from each provider
+- **Smart model ordering**: Latest models preselected by default (reverse version sort); Anthropic models ordered by tier (opus → sonnet → haiku)
 - **Interactive menus**: Arrow-key navigation with scroll support
 - **Smart tier mapping**: Automatically maps opus/sonnet/haiku tiers for z.ai
 - **Tool-calling detection**: Warns about Ollama models without tool support
+- **Session recording**: Optional asciinema recording of Claude Code sessions
 - **Sudo caching**: Pre-caches sudo credentials for Claude Code sessions
 
 ## Installation

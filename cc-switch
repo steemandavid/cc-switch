@@ -39,7 +39,7 @@ CC_SWITCH_VERSION="1.8 — 2026-03-12"
 _cc_parse_models() {
   local json="$1" filter="$2"
   if command -v jq &>/dev/null; then
-    echo "$json" | jq -r "$filter" 2>/dev/null | sort
+    echo "$json" | jq -r "$filter" 2>/dev/null | awk '{k=$0; gsub(/:/,"-",k); print k "\t" $0}' | sort -t$'\t' -k1,1rV | cut -f2
   elif command -v python3 &>/dev/null; then
     echo "$json" | python3 -c "
 import sys, json, re
@@ -51,7 +51,7 @@ for k in keys[:-1]:
     obj = obj[k] if isinstance(obj, dict) else [i[k] for i in obj]
 leaf = keys[-1]
 ids = [i[leaf] for i in (obj if isinstance(obj, list) else [obj]) if leaf in i and i[leaf]]
-for m in sorted(ids):
+for m in sorted(ids, key=lambda x: x.replace(":","-"), reverse=True):
     print(m)
 " 2>/dev/null
   fi
@@ -66,6 +66,36 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 RESET='\033[0m'
+
+# ── Recording directory ────────────────────────────────────────
+CC_RECORDINGS_DIR="${HOME}/asciinema-recordings"
+
+# ── Helper: launch Claude Code with optional asciinema recording ──
+# Usage: _cc_launch claude --model "xxx" --dangerously-skip-permissions
+# If asciinema is installed, wraps the session in a recording.
+# Falls back to running claude directly if asciinema is missing.
+_cc_launch() {
+  mkdir -p "$CC_RECORDINGS_DIR"
+  local timestamp
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  local cast_file="${CC_RECORDINGS_DIR}/claude-${timestamp}.cast"
+
+  if command -v asciinema &>/dev/null; then
+    echo -e "${DIM}  Recording session → ${cast_file}${RESET}"
+    echo ""
+    # asciinema handles SIGINT/SIGTERM gracefully — the cast file is
+    # finalized automatically when the child process (claude) exits.
+    asciinema rec -q --command "$*" "$cast_file"
+    local rc=$?
+    echo ""
+    echo -e "${GREEN}${BOLD}✔ Recording saved:${RESET} ${cast_file}"
+    echo -e "${DIM}  Playback: asciinema play ${cast_file}${RESET}"
+    return $rc
+  else
+    # No asciinema — just run claude normally
+    "$@"
+  fi
+}
 
 # ── Helper: ensure sudo credentials are cached ───────────────
 # Runs sudo -v only when the timestamp is absent or nearly expired.
@@ -262,6 +292,15 @@ _cc_backend_anthropic() {
     return 1
   fi
 
+  # Reorder: opus first, then sonnet, then haiku.
+  # Within each tier, put non-dated (canonical) models before dated snapshots.
+  local ordered=()
+  for tier in opus sonnet haiku; do
+    for m in "${model_list[@]}"; do [[ "$m" == *"$tier"* ]] && ! [[ "$m" =~ -[0-9]{8}$ ]] && ordered+=("$m"); done
+    for m in "${model_list[@]}"; do [[ "$m" == *"$tier"* ]] &&   [[ "$m" =~ -[0-9]{8}$ ]] && ordered+=("$m"); done
+  done
+  model_list=("${ordered[@]}")
+
   echo -e "\n${BOLD}Available Anthropic models:${RESET}"
   _cc_scroll_menu "Select model" "" "${model_list[@]}"
   if [[ $? -ne 0 ]]; then
@@ -287,7 +326,7 @@ _cc_backend_anthropic() {
   echo -e "${GREEN}${BOLD}  ${alias_label}: ${RESET}${GREEN}${model}${RESET}"
   echo -e "${DIM}  Lighter-tier routing managed by Claude Code / Pro subscription${RESET}\n"
   _cc_refresh_sudo
-  claude --model "$model" --dangerously-skip-permissions
+  _cc_launch claude --model "$model" --dangerously-skip-permissions
 }
 
 # ── Backend: z.ai ────────────────────────────────────────────
@@ -372,7 +411,7 @@ _cc_backend_zai() {
   echo -e "${MAGENTA}${BOLD}  Haiku  (fast tasks):    ${RESET}${MAGENTA}${haiku_model}${RESET}"
   echo ""
   _cc_refresh_sudo
-  claude --model "$model" --dangerously-skip-permissions
+  _cc_launch claude --model "$model" --dangerously-skip-permissions
 }
 
 # ── Backend: Ollama (local) ──────────────────────────────────
@@ -474,7 +513,7 @@ sys.exit(0 if 'tools' in d.get('capabilities',[]) else 1)
   fi
   echo ""
   _cc_refresh_sudo
-  claude --model "$model" --dangerously-skip-permissions
+  _cc_launch claude --model "$model" --dangerously-skip-permissions
 }
 
 # ── Main entrypoint ──────────────────────────────────────────
