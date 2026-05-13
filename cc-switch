@@ -57,6 +57,47 @@ for m in sorted(ids, key=lambda x: x.replace(":","-"), reverse=True):
   fi
 }
 
+# ── Helper: fetch URL with retries, timeouts, and error visibility ───
+# Usage: _cc_fetch <url> [curl_args...]
+# Prints response body to stdout on success. Returns 1 on failure.
+_cc_fetch() {
+  local url="$1"; shift
+  local max_retries=3 attempt=1
+  local response http_code body curl_exit
+
+  while (( attempt <= max_retries )); do
+    response=$(curl -s --connect-timeout 5 --max-time 15 \
+      -w '\n%{http_code}' "$url" "$@" 2>/dev/null)
+    curl_exit=$?
+
+    http_code=$(printf '%s' "$response" | tail -1)
+    body=$(printf '%s' "$response" | sed '$d')
+
+    if (( curl_exit != 0 )); then
+      if (( attempt < max_retries )); then
+        sleep 1
+        (( attempt++ ))
+        continue
+      fi
+      return 1
+    fi
+
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      printf '%s' "$body"
+      return 0
+    fi
+
+    # Retry server errors (5xx); fail fast on client errors (4xx)
+    if [[ "$http_code" =~ ^5 ]] && (( attempt < max_retries )); then
+      sleep 1
+      (( attempt++ ))
+      continue
+    fi
+
+    return 1
+  done
+}
+
 # ── Colours ──────────────────────────────────────────────────
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -278,9 +319,9 @@ _cc_backend_anthropic() {
   # Fetch live model list using the key — never exported to Claude Code
   echo -e "${DIM}Fetching available models from Anthropic...${RESET}"
   local raw
-  raw=$(curl -sf "https://api.anthropic.com/v1/models" \
+  raw=$(_cc_fetch "https://api.anthropic.com/v1/models" \
     -H "x-api-key: $ANTHROPIC_KEY" \
-    -H "anthropic-version: 2023-06-01" 2>/dev/null)
+    -H "anthropic-version: 2023-06-01")
 
   local model_list=()
   if [[ -n "$raw" ]]; then
@@ -345,9 +386,9 @@ _cc_backend_zai() {
   # Fetch live model list from z.ai's OpenAI-compatible /models endpoint
   echo -e "${DIM}Fetching available models from z.ai...${RESET}"
   local raw
-  raw=$(curl -sf "${zai_api_base}/models" \
+  raw=$(_cc_fetch "${zai_api_base}/models" \
     -H "Authorization: Bearer $ZAI_KEY" \
-    -H "Content-Type: application/json" 2>/dev/null)
+    -H "Content-Type: application/json")
 
   local model_list=()
   if [[ -n "$raw" ]]; then
