@@ -564,7 +564,7 @@ cc() {
   echo -e "╰─────────────────────────────────────╯${RESET}"
   echo -e "${DIM}  cc-switch v${CC_SWITCH_VERSION}${RESET}"
 
-  local backends=("Anthropic API (Claude Pro)" "z.ai" "Ollama (local models)")
+  local backends=("z.ai" "Anthropic API (Claude Pro)" "Ollama (local models)")
   _cc_scroll_menu "Select backend" "" "${backends[@]}"
   if [[ $? -ne 0 ]]; then
     echo -e "${YELLOW}Cancelled.${RESET}"
