@@ -31,7 +31,7 @@ _cc_load_keys() {
 }
 
 # ── Script version ───────────────────────────────────────────
-CC_SWITCH_VERSION="1.8 — 2026-03-12"
+CC_SWITCH_VERSION="1.10 — 2026-06-13"
 
 # ── Helper: parse a JSON model list ──────────────────────────
 # Prints one model ID per line, sorted.
@@ -121,21 +121,30 @@ _cc_launch() {
   timestamp=$(date +%Y%m%d-%H%M%S)
   local cast_file="${CC_RECORDINGS_DIR}/claude-${timestamp}.cast"
 
+  # Keep sudo cached for exactly the lifetime of this Claude Code process.
+  _cc_start_sudo_keepalive
+
+  local rc=0
   if command -v asciinema &>/dev/null; then
     echo -e "${DIM}  Recording session → ${cast_file}${RESET}"
     echo ""
     # asciinema handles SIGINT/SIGTERM gracefully — the cast file is
     # finalized automatically when the child process (claude) exits.
     asciinema rec -q --command "$*" "$cast_file"
-    local rc=$?
+    rc=$?
     echo ""
     echo -e "${GREEN}${BOLD}✔ Recording saved:${RESET} ${cast_file}"
     echo -e "${DIM}  Playback: asciinema play ${cast_file}${RESET}"
-    return $rc
   else
     # No asciinema — just run claude normally
     "$@"
+    rc=$?
   fi
+
+  # Claude exited — stop the keepalive loop. We deliberately do NOT run
+  # `sudo -k` (global tickets → would drop sudo for every john terminal).
+  _cc_stop_sudo_keepalive
+  return $rc
 }
 
 # ── Helper: ensure sudo credentials are cached ───────────────
@@ -152,6 +161,39 @@ _cc_refresh_sudo() {
       echo -e "${YELLOW}sudo -v failed — Claude Code will not be able to run sudo commands.${RESET}"
     }
   fi
+}
+
+# ── Helpers: keep sudo cached for the Claude Code session ──────
+# _cc_start_sudo_keepalive spawns a background loop that silently
+# refreshes the user's GLOBAL sudo ticket every 5 minutes using
+# `sudo -n` (non-interactive — it never prompts). It is started by
+# _cc_launch just before Claude runs and stopped the instant Claude
+# exits, so it does NOT linger in an open terminal afterwards.
+# Requires `timestamp_type=global` (see /etc/sudoers.d/global-tty).
+# No password is ever stored.
+_cc_start_sudo_keepalive() {
+  # Already running for this shell? skip.
+  if [[ -n "${_CC_SUDO_KEEPALIVE_PID:-}" ]] && kill -0 "$_CC_SUDO_KEEPALIVE_PID" 2>/dev/null; then
+    return 0
+  fi
+  # Only launch if we currently hold a valid ticket (primed by _cc_refresh_sudo).
+  sudo -n true 2>/dev/null || return 0
+  (
+    while true; do
+      sleep 300
+      # If the ticket was invalidated (e.g. someone ran `sudo -k`), stop.
+      sudo -n true 2>/dev/null || exit 0
+    done
+  ) &
+  _CC_SUDO_KEEPALIVE_PID=$!
+}
+
+_cc_stop_sudo_keepalive() {
+  if [[ -n "${_CC_SUDO_KEEPALIVE_PID:-}" ]] && kill -0 "$_CC_SUDO_KEEPALIVE_PID" 2>/dev/null; then
+    kill "$_CC_SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$_CC_SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
+  _CC_SUDO_KEEPALIVE_PID=""
 }
 
 
@@ -583,4 +625,4 @@ alias cc-anthropic='_cc_backend_anthropic'
 alias cc-zai='_cc_backend_zai'
 alias cc-local='_cc_backend_ollama'
 
-# cc-switch v1.9 — 2026-03-12
+# cc-switch v1.10 — 2026-06-13

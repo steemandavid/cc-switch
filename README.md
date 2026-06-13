@@ -11,7 +11,7 @@ Interactive Claude Code backend switcher with provider and model selection.
 - **Smart tier mapping**: Automatically maps opus/sonnet/haiku tiers for z.ai
 - **Tool-calling detection**: Warns about Ollama models without tool support
 - **Session recording**: Optional asciinema recording of Claude Code sessions
-- **Sudo caching**: Pre-caches sudo credentials for Claude Code sessions
+- **Sudo keepalive**: Pre-caches sudo credentials and keeps them alive for the entire Claude Code session via a background refresh loop that is stopped automatically when Claude exits (no password stored)
 
 ## Installation
 
@@ -57,6 +57,7 @@ cc-local      # Ollama
 - `curl` for API requests
 - `jq` or `python3` for JSON parsing
 - Claude Code CLI installed
+- `sudo` with `timestamp_type=global` (e.g. in `/etc/sudoers.d/`) so the keepalive can refresh the shared ticket; pair with a `timestamp_timeout` (e.g. 30) as a safety net
 
 ## License
 
