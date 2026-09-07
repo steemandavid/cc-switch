@@ -42,11 +42,27 @@ its own bashrc line — a path nothing sources. Don't rely on it for deployment.
 
 Activate with `source ~/.bashrc` (existing shells keep the old functions).
 
-## 4. Follow-ups
+## 4. Verification (later session, 2026-09-07)
 
-- Commit the v1.11 change in the **claudecode-sync** repo so the sync clone
-  doesn't drift (noted to user; handled by the cc-switch repo's own commit
-  here).
+End-to-end check confirmed the fix is live everywhere:
+
+- Dev repo: commit `e1cf7b4` (v1.11) contains all three backend changes.
+- Deploy chain: `~/.bashrc:127` → `~/bin/cc-switch.sh` (symlink) →
+  `claudecode-sync/bin/cc-switch.sh`, which is **byte-identical** to the dev
+  repo copy and matches its own committed version (`cbe977b` in the
+  claudecode-sync repo — the follow-up below is done).
+- `bash -n` passes on the deployed script.
+- Logic check: in `_cc_backend_zai` the disable-var is unset before the
+  known-model lookup, so `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and
+  `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` are mutually
+  exclusive in every path.
+- Caveat repeated: shells opened before the deploy still hold v1.10 functions;
+  `source ~/.bashrc` refreshes them.
+
+## 5. Follow-ups
+
+- ~~Commit the v1.11 change in the **claudecode-sync** repo~~ — done
+  (`cbe977b`, verified this session).
 - When new GLM models appear (e.g. glm-5.4), add their context window to the
   `glm_context` map in `_cc_backend_zai` if known, or they'll get the
   disabled-enforcement fallback.
