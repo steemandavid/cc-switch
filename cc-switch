@@ -31,7 +31,7 @@ _cc_load_keys() {
 }
 
 # ── Script version ───────────────────────────────────────────
-CC_SWITCH_VERSION="1.10 — 2026-06-13"
+CC_SWITCH_VERSION="1.11 — 2026-09-07"
 
 # ── Helper: parse a JSON model list ──────────────────────────
 # Prints one model ID per line, sorted.
@@ -394,6 +394,9 @@ _cc_backend_anthropic() {
 
   # Clear any API key / third-party vars so claude.ai session takes over
   unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+  # Clear third-party context-window overrides — Anthropic models are in
+  # Claude Code's catalog, which already knows their real windows.
+  unset CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
   export ANTHROPIC_MODEL="$model"
 
   # Derive the friendly alias for display (opus/sonnet/haiku)
@@ -483,6 +486,20 @@ _cc_backend_zai() {
   export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
   export ANTHROPIC_DEFAULT_SONNET_MODEL="$sonnet_model"
   export ANTHROPIC_DEFAULT_HAIKU_MODEL="$haiku_model"
+
+  # Third-party model IDs aren't in Claude Code's model catalog, so it
+  # assumes a 200k window and warns. Tell it the real window where known;
+  # for unknown models, disable the clamp and let the API report limits.
+  # GLM context windows: https://docs.z.ai/guides/llm/glm-5.3
+  unset CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
+  declare -A glm_context=([glm-5.3]=1000000 [glm-5.3-flash]=1000000)
+  if [[ -n "${glm_context[$model]:-}" ]]; then
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${glm_context[$model]}"
+  else
+    unset CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
+  fi
+
   # Prevent background calls to Anthropic's servers (would fail with a z.ai key)
   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
   export API_TIMEOUT_MS=3000000
@@ -586,6 +603,10 @@ sys.exit(0 if 'tools' in d.get('capabilities',[]) else 1)
   export ANTHROPIC_AUTH_TOKEN="ollama"
   export ANTHROPIC_API_KEY=""
   export ANTHROPIC_MODEL="$model"
+  # Local model IDs aren't in Claude Code's catalog — disable the 200k
+  # context clamp and let the API report the real limits instead.
+  unset CLAUDE_CODE_MAX_CONTEXT_TOKENS
+  export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 
   echo -e "\n${BLUE}${BOLD}✔ Backend:${RESET}${BLUE} Ollama local (${ollama_url})${RESET}"
   echo -e "${BLUE}${BOLD}  Model:  ${RESET}${BLUE} ${model}${RESET}"
@@ -625,4 +646,4 @@ alias cc-anthropic='_cc_backend_anthropic'
 alias cc-zai='_cc_backend_zai'
 alias cc-local='_cc_backend_ollama'
 
-# cc-switch v1.10 — 2026-06-13
+# cc-switch v1.11 — 2026-09-07

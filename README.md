@@ -12,6 +12,7 @@ Interactive Claude Code backend switcher with provider and model selection.
 - **Tool-calling detection**: Warns about Ollama models without tool support
 - **Session recording**: Optional asciinema recording of Claude Code sessions
 - **Sudo keepalive**: Pre-caches sudo credentials and keeps them alive for the entire Claude Code session via a background refresh loop that is stopped automatically when Claude exits (no password stored)
+- **Context-window handling**: Third-party model IDs aren't in Claude Code's model catalog, which would clamp sessions to a 200k auto-compact window with a warning. Known GLM windows (e.g. glm-5.3: 1M) are set via `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; unknown models (z.ai or Ollama) fall back to `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. Both are unset on the Anthropic backend so they don't leak between sessions.
 
 ## Installation
 
